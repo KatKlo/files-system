@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <printf.h>
 
 #include "HashMap.h"
 #include "Tree.h"
@@ -16,7 +17,7 @@ struct Node {
     pthread_cond_t *readers;
     pthread_cond_t *writers;
     pthread_cond_t *remove;
-    int rcount, wcount, rwait, wwait, removewait, removecount;
+    int rcount, wcount, rwait, wwait, removewait;
     int dupa;
     int change; // 0 - no one, 1 - readers, 2 - writer, 3 - remove
     int readers_to_wake; // how many readers to wake
@@ -61,7 +62,6 @@ static Node *node_new() {
     node->rwait = 0;
     node->wwait = 0;
     node->removewait = 0;
-    node->removecount = 0;
     node->readers_to_wake = 0;
     node->dupa = 0;
     node->change = 0;
@@ -169,8 +169,6 @@ void node_get_as_remove(Node * node) {
     if (pthread_mutex_lock(node->lock) != 0)
         syserr("lock failed");
 
-    node->dupa--;
-
     while (node->rcount + node->wcount + node->rwait + node->wwait + node->change + node->dupa > 0) {
         node->removewait++;
 
@@ -183,8 +181,6 @@ void node_get_as_remove(Node * node) {
             node->change = 0;
     }
 
-    node->removecount++;
-
     if (pthread_mutex_unlock(node->lock) != 0)
         syserr ("unlock failed");
 }
@@ -195,13 +191,13 @@ void node_free_as_reader(Node *node) {
 
     node->rcount--;
 
-    if(node->rcount == 0) {
+    if(node->rcount == 0 && node->readers_to_wake == 0) {
         if(node->wwait > 0)
             signal_with_change(node, node->writers, 2);
         else if(node->rwait > 0) {
             node->readers_to_wake = node->rwait;
             signal_with_change(node, node->readers, 1);
-        } else if (node->removewait > 0 && node->dupa > 0) {
+        } else if (node->removewait > 0 && node->dupa == 0) {
             signal_with_change(node, node->remove, 3);
         }
     }
@@ -222,7 +218,7 @@ void node_free_as_writer(Node *node) {
         signal_with_change(node,node->readers, 1);
     } else if(node->wwait > 0) {
         signal_with_change(node, node->writers, 2);
-    } else if (node->removewait > 0 && node->dupa > 0) {
+    } else if (node->removewait > 0 && node->dupa == 0) {
         signal_with_change(node, node->remove, 3);
     }
 
@@ -234,8 +230,7 @@ void node_free_as_writer(Node *node) {
 static int node_free(Node *node, bool delete_all) {
     node_get_as_remove(node);
 
-    if (!delete_all && hmap_size(node->sub_folders) != 0) {
-        node_free_as_writer(node);
+    if (!delete_all && hmap_size(node->sub_folders) > 0) {
         return ENOTEMPTY;
     }
 
@@ -271,8 +266,8 @@ void tree_free(Tree *tree) {
     free(tree);
 }
 
-static Node *find_node(Tree *tree, const char *path, Node *** nodes_path, size_t* nodes_path_len) {
-    Node *node = tree->root;
+static Node *find_node(const char *path, Node ***nodes_path, size_t *nodes_path_len, Node *begin, bool own) {
+    Node *node = begin;
     void *sth;
 
     int count = 0;
@@ -280,12 +275,14 @@ static Node *find_node(Tree *tree, const char *path, Node *** nodes_path, size_t
     char component[MAX_FOLDER_NAME_LENGTH + 1];
     const char *subpath = path;
     while ((subpath = split_path(subpath, component))) {
-        node_get_as_reader(node);
+        if (node != begin || !own)
+            node_get_as_reader(node);
 
         sth = hmap_get(node->sub_folders, component);
 
         if (!sth) {
-            node_free_as_reader(node);
+            if (node != begin || !own)
+                node_free_as_reader(node);
             return NULL;
         }
 
@@ -300,19 +297,21 @@ static Node *find_node(Tree *tree, const char *path, Node *** nodes_path, size_t
         }
         (*nodes_path)[(*nodes_path_len)++] = node;
 
-        node_free_as_reader(old_node);
+        if (old_node != begin || !own)
+            node_free_as_reader(old_node);
     }
 
     return node;
 }
 
-static Node *find_parent(Tree *tree, const char *path, char *subfolder_name, Node *** nodes_path, size_t* nodes_path_len) {
+static Node *
+find_parent(const char *path, char *subfolder_name, Node ***nodes_path, size_t *nodes_path_len, Node *begin, bool own) {
     char *subpath = make_path_to_parent(path, subfolder_name);
 
     if (!subpath)
         return NULL;
 
-    Node * result = find_node(tree, subpath, nodes_path, nodes_path_len);
+    Node * result = find_node(subpath, nodes_path, nodes_path_len, begin, own);
 
     free(subpath);
 
@@ -326,7 +325,7 @@ char *tree_list(Tree *tree, const char *path) {
     Node ** nodes_path = NULL;
     size_t nodes_path_len = 0;
 
-    Node *node = find_node(tree, path, &nodes_path, &nodes_path_len);
+    Node *node = find_node(path, &nodes_path, &nodes_path_len, tree->root, false);
 
     if (!node) {
         decrease_dupa_path(nodes_path, nodes_path_len);
@@ -334,8 +333,6 @@ char *tree_list(Tree *tree, const char *path) {
     }
 
     node_get_as_reader(node);
-
-    increase_dupa(node);
 
     char * result;
 
@@ -345,8 +342,6 @@ char *tree_list(Tree *tree, const char *path) {
         result = calloc(1, sizeof(char));
         result[0] = '\0';
     }
-
-    decrease_dupa(node);
 
     decrease_dupa_path(nodes_path, nodes_path_len);
 
@@ -366,7 +361,7 @@ int tree_create(Tree *tree, const char *path) {
     size_t nodes_path_len = 0;
 
     char name[MAX_FOLDER_NAME_LENGTH + 1];
-    Node *parent = find_parent(tree, path, name, &nodes_path, &nodes_path_len);
+    Node *parent = find_parent(path, name, &nodes_path, &nodes_path_len, tree->root, false);
 
     if (parent == NULL) {
         decrease_dupa_path(nodes_path, nodes_path_len);
@@ -396,8 +391,6 @@ Node * get_child(Node *parent, const char *name) {
     if (sth == NULL)
         return NULL;
 
-    increase_dupa(sth);
-
     return (Node *) sth;
 }
 
@@ -412,7 +405,7 @@ int tree_remove(Tree *tree, const char *path) {
     size_t nodes_path_len = 0;
 
     char name[MAX_FOLDER_NAME_LENGTH + 1];
-    Node *parent = find_parent(tree, path, name, &nodes_path, &nodes_path_len);
+    Node *parent = find_parent(path, name, &nodes_path, &nodes_path_len, tree->root, false);
     Node *child;
 
     if (parent == NULL ) {
@@ -442,6 +435,46 @@ int tree_remove(Tree *tree, const char *path) {
     return 0;
 }
 
+char *find_both_parent(const char *source, const char *target, char **new_source, char **new_target) {
+    int i = 0, j = 0, last_ok = 0;
+    char component[MAX_FOLDER_NAME_LENGTH + 1];
+    char *source_parent = make_path_to_parent(source, component);
+    char *target_parent = make_path_to_parent(target, component);
+
+    int source_size = strlen(source), target_size = strlen(target);
+    int source_parent_size = strlen(source_parent), target_parent_size = strlen(target_parent);
+
+    while (i < source_parent_size && j < target_parent_size) {
+        if (source_parent[i] != target_parent[j])
+            break;
+
+        if (source_parent[i] == '/')
+            last_ok = i;
+        i++;
+        j++;
+    }
+
+    *new_source = malloc((source_size - last_ok + 1) * sizeof(char));
+    *new_target = malloc((target_size - last_ok + 1) * sizeof(char));
+    char *found_parent = malloc((last_ok + 2) * sizeof(char));
+
+    for (int k = 0; k <= last_ok; k++) {
+        found_parent[k] = source[k];
+    }
+    found_parent[last_ok + 1] = '\0';
+
+    for (int k = last_ok; k < source_size + 1; k++) {
+        (*new_source)[k - last_ok] = source[k];
+    }
+
+    for (int k = last_ok; k < target_size + 1; k++) {
+        (*new_target)[k - last_ok] = target[k];
+    }
+
+    return found_parent;
+
+}
+
 int tree_move(Tree *tree, const char *source, const char *target) {
     if (!is_path_valid(source) || !is_path_valid(target))
         return EINVAL;
@@ -450,64 +483,87 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     if (strcmp(target, "/") == 0)
         return EEXIST;
 
+    if (strlen(source) < strlen(target) && strncmp(source, target, strlen(source)) == 0) {
+        return ENOTALLOW;
+    }
+
     Node ** nodes_path_source = NULL;
     size_t nodes_path_len_source = 0;
     Node ** nodes_path_target = NULL;
     size_t nodes_path_len_target = 0;
+    Node ** nodes_path_parent = NULL;
+    size_t nodes_path_len_parent = 0;
+    char *new_source = NULL, *new_target = NULL;
+    char *parent_string = find_both_parent(source, target, &new_source, &new_target);
+
+    Node *parent = find_node(parent_string, &nodes_path_parent, &nodes_path_len_parent, tree->root, false);
+
+    if (parent == NULL) {
+        decrease_dupa_path(nodes_path_parent, nodes_path_len_parent);
+        return ENOENT;
+    }
+
+    node_get_as_writer(parent);
 
     char name_source[MAX_FOLDER_NAME_LENGTH + 1];
-    Node *parent_source = find_parent(tree, source, name_source, &nodes_path_source, &nodes_path_len_source);
+    Node *parent_source = find_parent(new_source, name_source, &nodes_path_source, &nodes_path_len_source, parent,
+                                      true);
     Node *to_move;
 
-    char name_target[MAX_FOLDER_NAME_LENGTH + 1];
-    Node *parent_target = find_parent(tree, target, name_target, &nodes_path_target, &nodes_path_len_target);
-
-    if (strncmp(source, target, strlen(source)) == 0 && strlen(source) != strlen(target)) {
-        decrease_dupa_path(nodes_path_source, nodes_path_len_source);
-        decrease_dupa_path(nodes_path_target, nodes_path_len_target);
-        return ENOTALLOW;
-    }
-
     if (parent_source == NULL) {
+        decrease_dupa_path(nodes_path_parent, nodes_path_len_parent);
         decrease_dupa_path(nodes_path_source, nodes_path_len_source);
-        decrease_dupa_path(nodes_path_target, nodes_path_len_target);
+        node_free_as_writer(parent);
         return ENOENT;
     }
 
-    node_get_as_writer(parent_source);
+    char name_target[MAX_FOLDER_NAME_LENGTH + 1];
+    Node *parent_target = find_parent(new_target, name_target, &nodes_path_target, &nodes_path_len_target, parent,
+                                      true);
+
+    if (parent_source != parent)
+        node_get_as_writer(parent_source);
 
     if ((to_move = get_child(parent_source, name_source)) == NULL) {
+        decrease_dupa_path(nodes_path_parent, nodes_path_len_parent);
         decrease_dupa_path(nodes_path_source, nodes_path_len_source);
         decrease_dupa_path(nodes_path_target, nodes_path_len_target);
-        node_free_as_writer(parent_source);
+
+        if (parent_source != parent)
+            node_free_as_writer(parent_source);
+        node_free_as_writer(parent);
         return ENOENT;
     }
-
-    node_get_as_remove(to_move);
 
     if (strcmp(source, target) == 0) {
+        decrease_dupa_path(nodes_path_parent, nodes_path_len_parent);
         decrease_dupa_path(nodes_path_source, nodes_path_len_source);
         decrease_dupa_path(nodes_path_target, nodes_path_len_target);
-        node_free_as_writer(parent_source);
+
+        if (parent_source != parent)
+            node_free_as_writer(parent_source);
+        node_free_as_writer(parent);
         return 0;
     }
-    if (strncmp(source, target, strlen(source)) == 0) {
-        decrease_dupa_path(nodes_path_source, nodes_path_len_source);
-        decrease_dupa_path(nodes_path_target, nodes_path_len_target);
-        node_free_as_writer(parent_source);
-        return ENOTALLOW;
-    }
+
     if (parent_target == NULL) {
+        decrease_dupa_path(nodes_path_parent, nodes_path_len_parent);
         decrease_dupa_path(nodes_path_source, nodes_path_len_source);
         decrease_dupa_path(nodes_path_target, nodes_path_len_target);
-        node_free_as_writer(parent_source);
+        if (parent_source != parent)
+            node_free_as_writer(parent_source);
+        node_free_as_writer(parent);
         return ENOENT;
     }
 
-    if (parent_source != parent_target)
+    if (parent_source != parent_target && parent_target != parent)
         node_get_as_writer(parent_target);
 
+    if (parent_source != parent && parent_target != parent)
+        node_free_as_writer(parent);
+
     if (hmap_get(parent_target->sub_folders, name_target) != NULL) {
+        decrease_dupa_path(nodes_path_parent, nodes_path_len_parent);
         decrease_dupa_path(nodes_path_source, nodes_path_len_source);
         decrease_dupa_path(nodes_path_target, nodes_path_len_target);
 
@@ -519,9 +575,12 @@ int tree_move(Tree *tree, const char *source, const char *target) {
         return EEXIST;
     }
 
+    node_get_as_remove(to_move);
+
     hmap_remove(parent_source->sub_folders, name_source);
     hmap_insert(parent_target->sub_folders, name_target, (void *) to_move);
 
+    decrease_dupa_path(nodes_path_parent, nodes_path_len_parent);
     decrease_dupa_path(nodes_path_source, nodes_path_len_source);
     decrease_dupa_path(nodes_path_target, nodes_path_len_target);
 
