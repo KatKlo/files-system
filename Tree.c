@@ -471,6 +471,9 @@ char *find_both_parent(const char *source, const char *target, char **new_source
         (*new_target)[k - last_ok] = target[k];
     }
 
+    free(source_parent);
+    free(target_parent);
+
     return found_parent;
 
 }
@@ -497,8 +500,11 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     char *parent_string = find_both_parent(source, target, &new_source, &new_target);
 
     Node *parent = find_node(parent_string, &nodes_path_parent, &nodes_path_len_parent, tree->root, false);
+    free(parent_string);
 
     if (parent == NULL) {
+        free(new_source);
+        free(new_target);
         decrease_dupa_path(nodes_path_parent, nodes_path_len_parent);
         return ENOENT;
     }
@@ -509,8 +515,10 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     Node *parent_source = find_parent(new_source, name_source, &nodes_path_source, &nodes_path_len_source, parent,
                                       true);
     Node *to_move;
+    free(new_source);
 
     if (parent_source == NULL) {
+        free(new_target);
         decrease_dupa_path(nodes_path_parent, nodes_path_len_parent);
         decrease_dupa_path(nodes_path_source, nodes_path_len_source);
         node_free_as_writer(parent);
@@ -520,6 +528,7 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     char name_target[MAX_FOLDER_NAME_LENGTH + 1];
     Node *parent_target = find_parent(new_target, name_target, &nodes_path_target, &nodes_path_len_target, parent,
                                       true);
+    free(new_target);
 
     if (parent_source != parent)
         node_get_as_writer(parent_source);
