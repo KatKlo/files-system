@@ -2,10 +2,34 @@
 #include <stdlib.h>
 #include <sys/errno.h>
 #include <string.h>
+#include <assert.h>
 #include "tree_utils.h"
 #include "HashMap.h"
 #include "err.h"
 #include "path_utils.h"
+
+struct Vector {
+    Node **values;
+    size_t capacity;
+    size_t size;
+};
+
+struct Node {
+    HashMap *subfolders;
+
+    pthread_mutex_t* lock;
+    pthread_cond_t *readers;
+    pthread_cond_t *writers;
+    pthread_cond_t *removers;
+
+    int readers_count, writers_count;
+    int readers_wait, writers_wait, removers_wait;
+    int change; // 0 - no one, 1 - readers, 2 - writer, 3 - removers
+    int readers_to_wake; // how many readers to wake
+    int counter;
+
+    Vector *path;
+};
 
 void *safe_malloc(size_t size) {
     void *res = malloc(size);
@@ -16,44 +40,146 @@ void *safe_malloc(size_t size) {
     return res;
 }
 
-//static void safe_realloc(void **pointer, size_t new_size) {
-//    *pointer = realloc(pointer, new_size);
-//
-//    if (*pointer == NULL)
-//        syserr("realloc failed");
-//}
+static void safe_realloc(Node ***pointer, size_t new_size) {
+    *pointer = realloc(*pointer, new_size);
 
-Node *node_new() {
-    Node *node = (Node *) safe_malloc(sizeof(Node));
+    if (*pointer == NULL)
+        syserr("realloc failed");
+}
 
-    node->sub_folders = hmap_new();
+static Vector *vector_new() {
+    Vector *new_vector = (Vector *) safe_malloc(sizeof(Vector));
 
-    if (!node->sub_folders)
+    new_vector->values = NULL;
+    new_vector->capacity = 0;
+    new_vector->size = 0;
+
+    return new_vector;
+}
+
+static void vector_add_node(Vector *vector, Node *value) {
+    if (vector->size == vector->capacity) {
+        vector->capacity = vector->capacity * 2 + 1;
+        safe_realloc(&vector->values, vector->capacity * sizeof(Node *));
+    }
+
+    vector->values[vector->size++] = value;
+}
+
+static void vector_add_vector(Vector *vector, Vector *to_add) {
+    if (to_add == NULL)
+        return;
+
+    bool need_realloc = false;
+
+    while (vector->size + to_add->size > vector->capacity) {
+        need_realloc = true;
+        vector->capacity = vector->capacity * 2 + 1;
+    }
+
+    if (need_realloc)
+        safe_realloc(&vector->values, vector->capacity * sizeof(Node *));
+
+    for (int i = 0; i < to_add->size; i++) {
+        vector->values[vector->size++] = to_add->values[i];
+    }
+}
+
+void vector_change(Vector *vector, Vector *to_change, Node *value) {
+    if (to_change == NULL)
+        return;
+
+    bool need_realloc = false;
+
+    while (to_change->size + 1 > vector->capacity) {
+        need_realloc = true;
+        vector->capacity = vector->capacity * 2 + 1;
+    }
+
+    if (need_realloc)
+        safe_realloc(&vector->values, vector->capacity * sizeof(Node *));
+
+    vector->size = 0;
+
+    for (int i = 0; i < to_change->size; i++) {
+        vector->values[vector->size++] = to_change->values[i];
+    }
+
+    vector->values[vector->size++] = value;
+}
+
+static void vector_free(Vector *to_free) {
+    free(to_free->values);
+    free(to_free);
+}
+
+static void safe_mutex_init(pthread_mutex_t **mutex) {
+    *mutex = (pthread_mutex_t *) safe_malloc(sizeof(pthread_mutex_t));
+
+    if (pthread_mutex_init(*mutex, 0) != 0)
+        syserr("mutex init failed");
+}
+
+static void safe_cond_init(pthread_cond_t **cond) {
+    *cond = (pthread_cond_t *) safe_malloc(sizeof(pthread_cond_t));
+
+    if (pthread_cond_init(*cond, 0) != 0)
+        syserr("cond init failed");
+}
+
+static void safe_mutex_free(pthread_mutex_t *mutex) {
+    if (pthread_mutex_destroy(mutex))
+        syserr("mutex destroy failed");
+
+    free(mutex);
+}
+
+static void safe_cond_free(pthread_cond_t *cond) {
+    if (pthread_cond_destroy(cond) != 0)
+        syserr("cond destroy failed");
+
+    free(cond);
+}
+
+Node *node_new(Vector *parent_path) {
+    Node *new_node = (Node *) safe_malloc(sizeof(Node));
+
+    new_node->subfolders = hmap_new();
+
+    if (!new_node->subfolders)
         syserr("creating new hmap failed");
 
-    node->lock = (pthread_mutex_t *) safe_malloc(sizeof(pthread_mutex_t));
-    node->readers = (pthread_cond_t *) safe_malloc(sizeof(pthread_cond_t));
-    node->writers = (pthread_cond_t *) safe_malloc(sizeof(pthread_cond_t));
-    node->remove = (pthread_cond_t *) safe_malloc(sizeof(pthread_cond_t));
+    new_node->path = vector_new();
 
-    if (pthread_mutex_init(node->lock, 0) != 0)
-        syserr("mutex init failed");
-    if (pthread_cond_init(node->readers, 0) != 0)
-        syserr("cond init failed");
-    if (pthread_cond_init(node->writers, 0) != 0)
-        syserr("cond init failed");
-    if (pthread_cond_init(node->remove, 0) != 0)
-        syserr("cond init failed");
-    node->rcount = 0;
-    node->wcount = 0;
-    node->rwait = 0;
-    node->wwait = 0;
-    node->removewait = 0;
-    node->readers_to_wake = 0;
-    node->dupa = 0;
-    node->change = 0;
+    if (!new_node->path)
+        syserr("creating new vector failed");
 
-    return node;
+    vector_add_vector(new_node->path, parent_path);
+    vector_add_node(new_node->path, new_node);
+
+    safe_mutex_init(&new_node->lock);
+    safe_cond_init(&new_node->readers);
+    safe_cond_init(&new_node->writers);
+    safe_cond_init(&new_node->removers);
+
+    new_node->readers_count = 0;
+    new_node->writers_count = 0;
+    new_node->readers_wait = 0;
+    new_node->writers_wait = 0;
+    new_node->removers_wait = 0;
+    new_node->readers_to_wake = 0;
+    new_node->change = 0;
+    new_node->counter = 0;
+
+    return new_node;
+}
+
+HashMap *get_subfolders(Node *node) {
+    return node->subfolders;
+}
+
+Vector *get_nodes_path(Node *node) {
+    return node->path;
 }
 
 static void signal_with_change(Node *node, pthread_cond_t *who, int new_change) {
@@ -63,55 +189,66 @@ static void signal_with_change(Node *node, pthread_cond_t *who, int new_change) 
         syserr ("cond signal failed");
 }
 
-void decrease_dupa(Node *node) {
+void decrease_counter(Node *node) {
     if (pthread_mutex_lock(node->lock) != 0)
         syserr("lock failed");
 
-    node->dupa--;
+    node->counter--;
 
-    if (node->dupa + node->rwait + node->wwait + node->rcount + node->wcount + node->change == 0)
-        if (node->removewait > 0)
-            signal_with_change(node, node->remove, 3);
+    if (node->counter + node->readers_wait + node->writers_wait + node->readers_count + node->writers_count + node->change == 0)
+        if (node->removers_wait > 0)
+            signal_with_change(node, node->removers, 3);
 
     if (pthread_mutex_unlock(node->lock) != 0)
         syserr ("unlock failed");
 }
 
-static void increase_dupa(Node *node) {
+static void increase_counter(Node *node) {
     if (pthread_mutex_lock(node->lock) != 0)
         syserr("lock failed");
 
-    node->dupa++;
+    node->counter++;
 
     if (pthread_mutex_unlock(node->lock) != 0)
         syserr ("unlock failed");
 }
 
-void decrease_dupa_path(Node ** nodes_path, size_t nodes_path_len) {
-    for (int i = 0; i < nodes_path_len; i++) {
-        decrease_dupa(nodes_path[i]);
+void decrease_counter_path(Vector *nodes_path, Node *begin) {
+    if (!nodes_path)
+        return;
+
+    int i = 0;
+
+    if (begin != NULL)
+        while (nodes_path->values[i] != begin)
+            i++;
+
+    i++;
+
+    for (; i < nodes_path->size; i++) {
+        decrease_counter(nodes_path->values[i]);
     }
-
-    free(nodes_path);
 }
 
-void node_get_as_reader(Node * node) {
+void node_get_as_reader(Node *node) {
     if (pthread_mutex_lock(node->lock) != 0)
         syserr("lock failed");
 
-    while (node->wcount + node->wwait + node->change > 0) {
-        node->rwait++;
+    while (node->writers_count + node->writers_wait + node->change > 0) {
+        node->readers_wait++;
+
         if (pthread_cond_wait(node->readers, node->lock) != 0)
             syserr("cond wait failed");
 
-        node->rwait--;
+        node->readers_wait--;
+
         if (node->change == 1) {
             node->readers_to_wake--;
             break;
         }
     }
 
-    node->rcount++;
+    node->readers_count++;
 
     if(node->readers_to_wake > 0)
         signal_with_change(node, node->readers, 1);
@@ -126,35 +263,35 @@ void node_get_as_writer(Node * node) {
     if (pthread_mutex_lock(node->lock) != 0)
         syserr("lock failed");
 
-    while (node->rcount + node->wcount + node->change > 0) {
-        node->wwait++;
+    while (node->readers_count + node->writers_count + node->change > 0) {
+        node->writers_wait++;
 
         if (pthread_cond_wait(node->writers, node->lock) != 0)
             syserr("cond wait failed");
 
-        node->wwait--;
+        node->writers_wait--;
 
         if (node->change == 2)
             node->change = 0;
     }
 
-    node->wcount++;
+    node->writers_count++;
 
     if (pthread_mutex_unlock(node->lock) != 0)
         syserr ("unlock failed");
 }
 
-void node_get_as_remove(Node * node) {
+void node_get_as_remover(Node * node) {
     if (pthread_mutex_lock(node->lock) != 0)
         syserr("lock failed");
 
-    while (node->rcount + node->wcount + node->rwait + node->wwait + node->change + node->dupa > 0) {
-        node->removewait++;
+    while (node->readers_count + node->writers_count + node->readers_wait + node->writers_wait + node->change + node->counter > 0) {
+        node->removers_wait++;
 
-        if (pthread_cond_wait(node->remove, node->lock) != 0)
+        if (pthread_cond_wait(node->removers, node->lock) != 0)
             syserr("cond wait failed");
 
-        node->removewait--;
+        node->removers_wait--;
 
         if (node->change == 3)
             node->change = 0;
@@ -168,16 +305,16 @@ void node_free_as_reader(Node *node) {
     if (pthread_mutex_lock(node->lock) != 0)
         syserr("lock failed");
 
-    node->rcount--;
+    node->readers_count--;
 
-    if(node->rcount == 0 && node->readers_to_wake == 0) {
-        if(node->wwait > 0)
+    if(node->readers_count == 0 && node->readers_to_wake == 0) {
+        if(node->writers_wait > 0) {
             signal_with_change(node, node->writers, 2);
-        else if(node->rwait > 0) {
-            node->readers_to_wake = node->rwait;
+        } else if(node->readers_wait > 0) {
+            node->readers_to_wake = node->readers_wait;
             signal_with_change(node, node->readers, 1);
-        } else if (node->removewait > 0 && node->dupa == 0) {
-            signal_with_change(node, node->remove, 3);
+        } else if (node->removers_wait > 0 && node->counter == 0) {
+            signal_with_change(node, node->removers, 3);
         }
     }
 
@@ -190,15 +327,15 @@ void node_free_as_writer(Node *node) {
     if (pthread_mutex_lock(node->lock) != 0)
         syserr("lock failed");
 
-    node->wcount--;
+    node->writers_count--;
 
-    if(node->rwait > 0) {
-        node->readers_to_wake = node->rwait;
+    if(node->readers_wait > 0) {
+        node->readers_to_wake = node->readers_wait;
         signal_with_change(node,node->readers, 1);
-    } else if(node->wwait > 0) {
+    } else if(node->writers_wait > 0) {
         signal_with_change(node, node->writers, 2);
-    } else if (node->removewait > 0 && node->dupa == 0) {
-        signal_with_change(node, node->remove, 3);
+    } else if (node->removers_wait > 0 && node->counter == 0) {
+        signal_with_change(node, node->removers, 3);
     }
 
     if (pthread_mutex_unlock(node->lock) != 0)
@@ -207,84 +344,72 @@ void node_free_as_writer(Node *node) {
 }
 
 int node_free(Node *node, bool delete_all) {
-    node_get_as_remove(node);
+    node_get_as_remover(node);
 
-    if (!delete_all && hmap_size(node->sub_folders) > 0) {
+    if (!delete_all && hmap_size(node->subfolders) > 0) {
         return ENOTEMPTY;
     }
 
     const char *key;
     void *value;
 
-    HashMapIterator it = hmap_iterator(node->sub_folders);
-    while (hmap_next(node->sub_folders, &it, &key, &value))
-        node_free((Node *) value, true);
+    HashMapIterator it = hmap_iterator(node->subfolders);
+    while (hmap_next(node->subfolders, &it, &key, &value))
+        node_free((Node *) value, delete_all);
 
-    hmap_free(node->sub_folders);
+    hmap_free(node->subfolders);
+    vector_free(node->path);
 
-    if (pthread_cond_destroy(node->readers) != 0)
-        syserr("cond destroy failed");
-    free(node->readers);
-    if (pthread_cond_destroy(node->writers) != 0)
-        syserr("cond destroy failed");
-    free(node->writers);
-    if (pthread_cond_destroy(node->remove) != 0)
-        syserr("mutex destroy failed");
-    free(node->remove);
-    if (pthread_mutex_destroy(node->lock) != 0)
-        syserr("mutex destroy failed");
-    free(node->lock);
+    safe_mutex_free(node->lock);
+    safe_cond_free(node->readers);
+    safe_cond_free(node->writers);
+    safe_cond_free(node->removers);
 
     free(node);
 
     return 0;
 }
 
-Node *find_node(const char *path, Node ***nodes_path, size_t *nodes_path_len, Node *begin, bool own) {
+Node *find_node(const char *path, Node *begin, bool begin_rw_locked) {
     Node *node = begin;
-    void *sth;
-
-    int count = 0;
+    void *maybe_node;
 
     char component[MAX_FOLDER_NAME_LENGTH + 1];
     const char *subpath = path;
+
     while ((subpath = split_path(subpath, component))) {
-        if (node != begin || !own)
+        if (node != begin || !begin_rw_locked)
             node_get_as_reader(node);
 
-        sth = hmap_get(node->sub_folders, component);
+        maybe_node = hmap_get(node->subfolders, component);
 
-        if (!sth) {
-            if (node != begin || !own)
+        if (!maybe_node) {
+            decrease_counter_path(node->path, begin);
+
+            if (node != begin || !begin_rw_locked)
                 node_free_as_reader(node);
+
             return NULL;
         }
 
         Node *old_node = node;
+        node = (Node *) maybe_node;
+        increase_counter(node);
 
-        node = (Node *) sth;
-        increase_dupa(node);
-
-        if (count == *nodes_path_len) {
-            count = count * 2 + 1;
-            *nodes_path = (Node **) realloc(*nodes_path, count * sizeof(Node *));
-        }
-        (*nodes_path)[(*nodes_path_len)++] = node;
-
-        if (old_node != begin || !own)
+        if (old_node != begin || !begin_rw_locked)
             node_free_as_reader(old_node);
     }
 
     return node;
 }
 
-Node *find_parent(const char *path, char *subfolder_name, Node ***nodes_path, size_t *nodes_path_len, Node *begin, bool own) {
+Node *find_parent(const char *path, char *subfolder_name, Node *begin, bool own) {
     char *subpath = make_path_to_parent(path, subfolder_name);
 
     if (!subpath)
         return NULL;
 
-    Node * result = find_node(subpath, nodes_path, nodes_path_len, begin, own);
+    Node * result = find_node(subpath, begin, own);
 
     free(subpath);
 
@@ -292,12 +417,28 @@ Node *find_parent(const char *path, char *subfolder_name, Node ***nodes_path, si
 }
 
 Node * get_child(Node *parent, const char *name) {
-    Node * sth = hmap_get(parent->sub_folders, name);
+    Node *sth = hmap_get(parent->subfolders, name);
 
     if (sth == NULL)
         return NULL;
 
     return (Node *) sth;
+}
+
+void change_nodes_paths(Node *node, Node *new_parent) {
+    node_get_as_reader(node);
+
+    vector_change(node->path, new_parent->path, node);
+
+    const char *key;
+    void *value;
+
+    HashMapIterator it = hmap_iterator(node->subfolders);
+    while (hmap_next(node->subfolders, &it, &key, &value))
+        change_nodes_paths((Node *) value, node);
+
+    node_free_as_reader(node);
+
 }
 
 char *find_both_parent(const char *source, const char *target, char **new_source, char **new_target) {
@@ -340,5 +481,4 @@ char *find_both_parent(const char *source, const char *target, char **new_source
     free(target_parent);
 
     return found_parent;
-
 }
