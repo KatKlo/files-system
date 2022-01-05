@@ -1,6 +1,6 @@
 #pragma once
 
-#define ENOTALLOW -1 // in move: target is
+#define ENOTALLOW -1
 
 typedef struct Tree Tree; // Let "Tree" mean the same as "struct Tree".
 
