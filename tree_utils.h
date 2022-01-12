@@ -3,31 +3,25 @@
 #include <stdbool.h>
 #include "HashMap.h"
 
-#define ENOTALLOW -1
-
 typedef struct Node Node;
-
-typedef struct Vector Vector;
 
 void *safe_malloc(size_t);
 
-Node *node_new(Vector *);
+Node *node_new(Node *);
 
 int node_free(Node *, bool);
 
-void change_nodes_paths(Node *, Node *);
+HashMap *get_sub_folders(Node *);
 
-HashMap *get_subfolders(Node *);
+Node * get_child(Node *, const char *);
 
-Vector *get_nodes_path(Node *);
+void change_parent(Node *, Node *);
 
 Node *find_node(const char *, Node *, bool);
 
 Node *find_parent(const char *, char *, Node *, bool);
 
-void decrease_counter(Node *node);
-
-void decrease_counter_path(Vector *, Node *);
+void decrease_counter(Node *, Node *);
 
 void node_get_as_reader(Node *);
 
@@ -38,7 +32,3 @@ void node_get_as_remover(Node *node);
 void node_free_as_reader(Node *);
 
 void node_free_as_writer(Node *);
-
-Node * get_child(Node *parent, const char *name);
-
-char *find_both_parent(const char *, const char *, char **, char **);

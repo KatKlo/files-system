@@ -1,7 +1,5 @@
 #pragma once
 
-#define ENOTALLOW -1
-
 typedef struct Tree Tree; // Let "Tree" mean the same as "struct Tree".
 
 Tree* tree_new();
@@ -15,3 +13,4 @@ int tree_create(Tree* tree, const char* path);
 int tree_remove(Tree* tree, const char* path);
 
 int tree_move(Tree* tree, const char* source, const char* target);
+

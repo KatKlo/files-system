@@ -49,3 +49,6 @@ const char** make_map_contents_array(HashMap* map);
 // The result has no trailing comma. An empty map yields an empty string.
 // The caller should free the result.
 char* make_map_contents_string(HashMap* map);
+
+// Search for path to LCA and paths to source and target from LCA
+char *find_LCA(const char *source, const char *target, char **new_source, char **new_target);

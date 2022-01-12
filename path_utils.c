@@ -117,3 +117,46 @@ char* make_map_contents_string(HashMap* map)
     free(keys);
     return result;
 }
+
+// Search for path to LCA and paths to source and target from LCA
+char *find_LCA(const char *source, const char *target, char **new_source, char **new_target) {
+    size_t i = 0, j = 0, last_ok = 0;
+    char component[MAX_FOLDER_NAME_LENGTH + 1];
+    char *source_parent = make_path_to_parent(source, component);
+    char *target_parent = make_path_to_parent(target, component);
+
+    size_t source_size = strlen(source), target_size = strlen(target);
+    size_t source_parent_size = strlen(source_parent), target_parent_size = strlen(target_parent);
+
+    while (i < source_parent_size && j < target_parent_size) {
+        if (source_parent[i] != target_parent[j])
+            break;
+
+        if (source_parent[i] == '/')
+            last_ok = i;
+        i++;
+        j++;
+    }
+
+    *new_source = malloc((source_size - last_ok + 1) * sizeof(char));
+    *new_target = malloc((target_size - last_ok + 1) * sizeof(char));
+    char *found_parent = malloc((last_ok + 2) * sizeof(char));
+
+    for (size_t k = 0; k <= last_ok; k++) {
+        found_parent[k] = source[k];
+    }
+    found_parent[last_ok + 1] = '\0';
+
+    for (size_t k = last_ok; k < source_size + 1; k++) {
+        (*new_source)[k - last_ok] = source[k];
+    }
+
+    for (size_t k = last_ok; k < target_size + 1; k++) {
+        (*new_target)[k - last_ok] = target[k];
+    }
+
+    free(source_parent);
+    free(target_parent);
+
+    return found_parent;
+}
