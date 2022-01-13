@@ -1,12 +1,13 @@
+#include "Tree.h"
+
 #include <errno.h>
+#include <printf.h>
 #include <stdlib.h>
 #include <string.h>
-#include <printf.h>
 
 #include "HashMap.h"
-#include "Tree.h"
+#include "Node.h"
 #include "path_utils.h"
-#include "tree_utils.h"
 
 #define ENOTALLOW -1 // Trying to move node to it's sub folder
 
@@ -48,16 +49,16 @@ char *tree_list(Tree *tree, const char *path) {
         result[0] = '\0';
     }
 
-    decrease_counter(node, tree->root);
     node_free_as_reader(node);
+    decrease_counter(node, tree->root);
 
     return result;
 }
 
 // Clean changes in tree after create/remove, also if error is returned
-void tree_create_remove_cleanup(Tree *tree, Node *to_free) {
-    decrease_counter(to_free, tree->root);
+static void tree_create_remove_cleanup(Tree *tree, Node *to_free) {
     node_free_as_writer(to_free);
+    decrease_counter(to_free, tree->root);
 }
 
 int tree_create(Tree *tree, const char *path) {
@@ -127,38 +128,37 @@ int tree_remove(Tree *tree, const char *path) {
 }
 
 // Decrease counters in tree after move, also if error is returned.
-void decrease_counters_for_move(Tree *tree, Node *LCA, Node *source, Node *target) {
+static void decrease_counters_for_move(Tree *tree, Node *LCA, Node *source, Node *target) {
     decrease_counter(LCA, tree->root);
     decrease_counter(source, LCA);
     decrease_counter(target, LCA);
 }
 
-// Clean changes in tree after move, also if error is returned.
-void tree_move_cleanup(Tree *tree, Node *LCA, Node *source, Node *target) {
-    decrease_counters_for_move(tree, LCA, source, target);
-
+// Clean changes in tree if error is returned in move.
+static void tree_move_cleanup(Tree *tree, Node *LCA, Node *source, Node *target) {
     if (source != target)
         node_free_as_writer(target);
 
     node_free_as_writer(source);
+    decrease_counters_for_move(tree, LCA, source, target);
 }
 
 // Checks basic things before move.
-int check_basics_move(const char *source, const char *target) {
-    if (!is_path_valid(source) || !is_path_valid(target))
+static int check_basics_move(const char *parent_source, const char *parent_target) {
+    if (!is_path_valid(parent_source) || !is_path_valid(parent_target))
         return EINVAL;
-    if (strcmp(source, "/") == 0)
+    if (strcmp(parent_source, "/") == 0)
         return EBUSY;
-    if (strcmp(target, "/") == 0)
+    if (strcmp(parent_target, "/") == 0)
         return EEXIST;
-    if (strlen(source) < strlen(target) && strncmp(source, target, strlen(source)) == 0)
+    if (strlen(parent_source) < strlen(parent_target) && strncmp(parent_source, parent_target, strlen(parent_source)) == 0)
         return ENOTALLOW;
 
     return 0;
 }
 
 // Remove lock from LCA end locks parent_source and parent_target.
-int lock_parents(Tree *tree, Node *LCA, Node *parent_source, Node *parent_target) {
+static int lock_parents(Tree *tree, Node *LCA, Node *parent_source, Node *parent_target) {
     if (parent_source == NULL || parent_target == NULL) {
         decrease_counters_for_move(tree, LCA, parent_source, parent_target);
         node_free_as_writer(LCA);
@@ -171,10 +171,34 @@ int lock_parents(Tree *tree, Node *LCA, Node *parent_source, Node *parent_target
     if (parent_source != parent_target && parent_target != LCA)
         node_get_as_writer(parent_target);
 
+    // We can free LCA because we already locked parent_source and parent_target
     if (parent_source != LCA && parent_target != LCA)
         node_free_as_writer(LCA);
 
     return 0;
+}
+
+static void move_source_and_free(Node *parent_source, Node *parent_target, Node *to_move,
+                          char *name_source, char *name_target) {
+
+    hmap_remove(get_sub_folders(parent_source), name_source);
+
+    // We can free parent_source because we already remove source from it
+    if (parent_source != parent_target)
+        node_free_as_writer(parent_source);
+
+    hmap_insert(get_sub_folders(parent_target), name_target, (void *) to_move);
+
+    node_get_as_remover(to_move);
+    node_get_as_writer(to_move);
+
+    // We can free parent_target because we already added source
+    // to its map and locked it so no one will get into
+    node_free_as_writer(parent_target);
+
+    change_parent(to_move, parent_target);
+
+    node_free_as_writer(to_move);
 }
 
 int tree_move(Tree *tree, const char *source, const char *target) {
@@ -222,14 +246,9 @@ int tree_move(Tree *tree, const char *source, const char *target) {
         return EEXIST;
     }
 
-    node_get_as_remover(to_move);
+    move_source_and_free(parent_source, parent_target, to_move, name_source, name_target);
 
-    hmap_remove(get_sub_folders(parent_source), name_source);
-    hmap_insert(get_sub_folders(parent_target), name_target, (void *) to_move);
-    change_parent(to_move, parent_target);
-
-    tree_move_cleanup(tree, LCA, parent_source, parent_target);
-
+    decrease_counters_for_move(tree, LCA, parent_source, parent_target);
     return 0;
 }
 

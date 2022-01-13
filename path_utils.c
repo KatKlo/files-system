@@ -118,7 +118,6 @@ char* make_map_contents_string(HashMap* map)
     return result;
 }
 
-// Search for path to LCA and paths to source and target from LCA
 char *find_LCA(const char *source, const char *target, char **new_source, char **new_target) {
     size_t i = 0, j = 0, last_ok = 0;
     char component[MAX_FOLDER_NAME_LENGTH + 1];

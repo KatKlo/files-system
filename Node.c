@@ -1,11 +1,12 @@
+#include "Node.h"
+
 #include <pthread.h>
 #include <stdlib.h>
-#include <sys/errno.h>
 #include <string.h>
-#include <assert.h>
-#include "tree_utils.h"
-#include "HashMap.h"
+#include <sys/errno.h>
+
 #include "err.h"
+#include "HashMap.h"
 #include "path_utils.h"
 
 struct Node {
@@ -66,7 +67,6 @@ Node *node_new(Node *parent) {
     Node *new_node = (Node *) safe_malloc(sizeof(Node));
 
     new_node->sub_folders = hmap_new();
-
     if (!new_node->sub_folders)
         syserr("creating new hmap failed");
 
@@ -199,8 +199,9 @@ void node_get_as_remover(Node *node) {
         syserr("lock failed");
 
     // Waits if there's any process in its tree except this one
-    while (node->readers_count + node->writers_count + node->readers_wait + node->writers_wait + node->change +
-           node->counter > 0) {
+    while (node->readers_count + node->writers_count + node->readers_wait
+            + node->writers_wait + node->change + node->counter > 0) {
+
         node->removers_wait++;
 
         if (pthread_cond_wait(node->removers, node->lock) != 0)
@@ -245,7 +246,6 @@ void node_free_as_writer(Node *node) {
     if (pthread_mutex_lock(node->lock) != 0)
         syserr("lock failed");
 
-    assert(node->writers_count == 1);
     node->writers_count--;
 
     // If any process is waiting, it'll be signalled
@@ -296,7 +296,6 @@ int node_free(Node *node, bool delete_all) {
 Node *find_node(const char *path, Node *begin, bool begin_rw_locked) {
     Node *node = begin;
     void *maybe_node;
-
     char component[MAX_FOLDER_NAME_LENGTH + 1];
     const char *subpath = path;
 
@@ -317,6 +316,7 @@ Node *find_node(const char *path, Node *begin, bool begin_rw_locked) {
 
         Node *old_node = node;
         node = (Node *) maybe_node;
+
         // Before freeing current node as reader we make sure that no process
         // will remove or move the next node we're going to
         increase_counter(node);
@@ -348,7 +348,5 @@ Node *get_child(Node *parent, const char *name) {
 
 // Change parent after moving node
 void change_parent(Node *node, Node *new_parent) {
-    node_get_as_reader(node);
     node->parent = new_parent;
-    node_free_as_reader(node);
 }
