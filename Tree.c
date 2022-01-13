@@ -8,6 +8,7 @@
 #include "HashMap.h"
 #include "Node.h"
 #include "path_utils.h"
+#include "err.h"
 
 #define ENOTALLOW -1 // Trying to move node to it's sub folder
 
@@ -16,7 +17,9 @@ struct Tree {
 };
 
 Tree *tree_new() {
-    Tree *tree = (Tree *) safe_malloc(sizeof(Tree));
+    Tree *tree = (Tree *) malloc(sizeof(Tree));\
+    if (tree == NULL)
+        syserr("malloc failed");
 
     tree->root = node_new(NULL);
 

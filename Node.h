@@ -5,8 +5,6 @@
 
 typedef struct Node Node;
 
-void *safe_malloc(size_t);
-
 Node *node_new(Node *);
 
 int node_free(Node *, bool);
